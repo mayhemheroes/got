@@ -1,0 +1,5 @@
+project: got
+target: fuzz_got_gdat
+cmds:
+  - cmd: /mayhem/fuzz_got_gdat
+    libfuzzer: true
