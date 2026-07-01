@@ -1,0 +1,5 @@
+project: got
+target: fuzz_got_branches
+cmds:
+  - cmd: /mayhem/fuzz_got_branches
+    libfuzzer: true
