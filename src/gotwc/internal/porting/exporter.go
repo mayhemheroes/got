@@ -15,15 +15,15 @@ import (
 
 type Exporter struct {
 	gotfs  *gotfs.Machine
-	db     *DB
+	db     *Cache
 	fsx    posixfs.FS
 	filter func(p string) bool
 }
 
-func NewExporter(gotfs *gotfs.Machine, db *DB, fsx posixfs.FS, filter func(p string) bool) *Exporter {
+func NewExporter(c *Cache, gotfs *gotfs.Machine, fsx posixfs.FS, filter func(p string) bool) *Exporter {
 	return &Exporter{
 		gotfs:  gotfs,
-		db:     db,
+		db:     c,
 		fsx:    fsx,
 		filter: filter,
 	}
@@ -39,7 +39,7 @@ func (pr *Exporter) ExportPath(ctx context.Context, ss gotfs.RO, root gotfs.Root
 	if gfinfo.Mode.IsDir() {
 		return pr.exportDir(ctx, ms, ds, root, p, gfinfo)
 	} else {
-		return pr.exportFile(ctx, ms, ds, root, p, gfinfo)
+		return pr.exportFile(ctx, ms, ds, root, p)
 	}
 }
 
@@ -52,7 +52,7 @@ func (pr *Exporter) ExportFile(ctx context.Context, ms, ds stores.RO, root gotfs
 	if !mode.IsRegular() {
 		return fmt.Errorf("ExportFile called for non-regular file %q: %v", p, mode)
 	}
-	return pr.exportFile(ctx, ms, ds, root, p, md)
+	return pr.exportFile(ctx, ms, ds, root, p)
 }
 
 func (pr *Exporter) Clobber(ctx context.Context, ss gotfs.RO, root gotfs.Root, p string) error {
@@ -71,15 +71,14 @@ func (pr *Exporter) Clobber(ctx context.Context, ss gotfs.RO, root gotfs.Root, p
 	if err := posixfs.PutFile(ctx, pr.fsx, p, md.Mode, r); err != nil {
 		return err
 	}
-	finfo, err := stat(pr.fsx, p)
+	info, err := stat(pr.fsx, p)
 	if err != nil {
 		return err
 	}
-	finfo.ByGot = true
-	if p == "" {
-		return nil
+	if err := pr.db.SetKnown(ctx, p, &info); err != nil {
+		return err
 	}
-	return pr.db.PutInfo(ctx, *finfo)
+	return nil
 }
 
 // exportDir exports a known dir in root
@@ -133,43 +132,28 @@ func (pr *Exporter) exportDir(ctx context.Context, ms, ds stores.RO, root gotfs.
 	}); err != nil {
 		return err
 	}
-	// record directory state after exporting children
-	dirInfo, err := stat(pr.fsx, p)
-	if err != nil {
-		return err
-	}
-	dirInfo.ByGot = true
-	if p != "" {
-		if err := pr.db.PutInfo(ctx, *dirInfo); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 // exportFile exports a known file in root
-func (pr *Exporter) exportFile(ctx context.Context, ms, ds stores.RO, root gotfs.Root, p string, ginfo *gotfs.Info) error {
+func (pr *Exporter) exportFile(ctx context.Context, ms, ds stores.RO, root gotfs.Root, p string) error {
 	// check if a file exists
 	finfo, err := stat(pr.fsx, p)
 	if err != nil && !posixfs.IsErrNotExist(err) {
 		return err
 	} else if err == nil {
-		var dbinfo FileInfo
-		if found, err := pr.db.GetInfo(ctx, p, &dbinfo); err != nil {
+		known, err := pr.db.IsKnown(ctx, p, finfo)
+		if err != nil {
 			return err
-		} else if !found {
-			return ErrWouldClobber{
-				Op:   "write",
-				Path: p,
-			}
-		} else if HasChanged(&dbinfo, finfo) {
+		}
+		if !known {
 			return ErrWouldClobber{
 				Op:   "write",
 				Path: p,
 			}
 		}
 	}
-	if finfo != nil && finfo.Mode.IsDir() {
+	if err == nil && finfo.Mode.IsDir() {
 		if err := pr.deleteDir(ctx, p); err != nil {
 			return err
 		}
@@ -178,37 +162,37 @@ func (pr *Exporter) exportFile(ctx context.Context, ms, ds stores.RO, root gotfs
 	if err != nil {
 		return err
 	}
-	r, err := pr.gotfs.NewReader(ctx, gotfs.RO{ds, ms}, root, p)
+	r, err := pr.gotfs.NewReader(ctx, gotfs.RO{Metadata: ms, Data: ds}, root, p)
 	if err != nil {
 		return err
 	}
 	if err := posixfs.PutFile(ctx, pr.fsx, p, gfinfo.Mode, r); err != nil {
 		return err
 	}
-	finfo, err = stat(pr.fsx, p)
+	nextInfo, err := stat(pr.fsx, p)
 	if err != nil {
 		return err
 	}
-	finfo.ByGot = true
-	return pr.db.PutInfo(ctx, *finfo)
+	if _, err := pr.db.UpdateInfo(ctx, p, nextInfo); err != nil {
+		return err
+	}
+	if err := pr.db.SetKnown(ctx, p, &nextInfo); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (pr *Exporter) deleteFile(ctx context.Context, p string) error {
-	var dbinfo FileInfo
-	if found, err := pr.db.GetInfo(ctx, p, &dbinfo); err != nil {
+	finfo, err := stat(pr.fsx, p)
+	if err != nil {
 		return err
-	} else if !found {
+	}
+	known, err := pr.db.IsKnown(ctx, p, finfo)
+	if err != nil {
+		return err
+	}
+	if !known {
 		return ErrWouldClobber{Op: "delete", Path: p}
-	} else if found {
-		// We know about this file, we can only delete it if
-		// it hasn't been changed since we last checked.
-		finfo, err := stat(pr.fsx, p)
-		if err != nil {
-			return err
-		}
-		if HasChanged(finfo, &dbinfo) {
-			return ErrWouldClobber{Op: "delete", Path: p}
-		}
 	}
 	if err := pr.fsx.Remove(p); err != nil {
 		return err

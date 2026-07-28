@@ -1,236 +1,509 @@
+// Package staging implements a staging area for transactions on GotFS filesystems.
+// The purpose of the stage is to accumulate changes made by the user using the got CLI,
+// and to then apply them to a previous filesystem, to get a new one.
 package staging
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path"
+	"sort"
 	"strings"
 
 	"go.brendoncarroll.net/exp/streams"
-	"go.brendoncarroll.net/stdctx/logctx"
+	"go.brendoncarroll.net/state/posixfs"
+	"go.brendoncarroll.net/tai64"
+	"go.etcd.io/bbolt"
 
 	"github.com/gotvc/got/src/gotfs"
 	"github.com/gotvc/got/src/gotfsvm"
 	"github.com/gotvc/got/src/gotkv"
+	"github.com/gotvc/got/src/gotwc/internal/porting"
+	"github.com/gotvc/got/src/internal/metrics"
 	"github.com/gotvc/got/src/internal/stores"
 	"github.com/gotvc/got/src/internal/volumes"
 )
 
-type Operation struct {
-	Delete *DeleteOp `json:"del,omitempty"`
-	Put    *PutOp    `json:"put,omitempty"`
-}
-
-// DeleteOp deletes a path and everything beneath it
-type DeleteOp struct{}
-
-// PutOp replaces a path with a filesystem.
-type PutOp = gotfs.Root
-
+// Entry is an entry in the stage
 type Entry struct {
-	Path string    `json:"p"`
-	Op   Operation `json:"op"`
+	Path    string
+	Segment gotfs.Segment
+	HasEntries bool
 }
 
-// Tx is a transaction on a stage
+func (ent Entry) Key(out []byte) []byte {
+	return append(out, ent.Path...)
+}
+
+func (ent Entry) Value(out []byte) []byte {
+	return ent.Segment.Marshal(out)
+}
+
+func ParseEntry(key, value []byte) (Entry, error) {
+	ent := Entry{
+		Path: string(key),
+	}
+	if len(value) == 0 {
+		return ent, nil
+	}
+	if err := ent.Segment.Unmarshal(value); err != nil {
+		return Entry{}, err
+	}
+	return ent, nil
+}
+
+func marshalStagedValue(ent gotfs.Entry) ([]byte, error) {
+	if ent.Key.IsInfo() {
+		return ent.Info.Marshal(nil), nil
+	}
+	return ent.Extent.MarshalBinary()
+}
+
+func stageEntriesPrefix(p string) []byte {
+	return append([]byte(p), 0)
+}
+
+func stageEntriesKey(p string, entryKey []byte) []byte {
+	out := stageEntriesPrefix(p)
+	out = append(out, entryKey...)
+	return out
+}
+
+var (
+	bucketStage = []byte("stage")
+)
+
+// Tx is a transaction on a stage.
+// It is not safe for concurrent use.
 type Tx struct {
-	tx        volumes.Tx
-	gotkv     gotkv.Machine
-	paramHash *[32]byte
-	s         stores.RW
+	env Env
 
-	kvtx *gotkv.Tx
+	c   *porting.Cache
+	imp *porting.Importer
 }
 
-func DefaultGotKV() gotkv.Machine {
-	return gotkv.NewMachine(gotkv.Params{MeanSize: 1 << 12, MaxSize: 1 << 18})
+type Env struct {
+	// Tx is an open transaction on the WC db
+	Tx *bbolt.Tx
+	// VolTx is a transaction on the staging Volume.
+	// All filesystem content is written here.
+	VolTx volumes.Tx
+	// GotFS is the gotfs machine to use for manipulating files.
+	GotFS *gotfs.Machine
+	// ParamHash if not-nil is the hash of the parameters that affect how files are converted to blobs
+	// if nil, then the stage is read-only.
+	ParamHash *[32]byte
 }
 
 // New wraps a transaction to create a transaction on a Stage
 // paramHash if not-nil, causes operations to error if it does not
 // match the paramHash in the stage
-func New(kvmach *gotkv.Machine, tx volumes.Tx, paramHash *[32]byte) *Tx {
+func New(env Env) *Tx {
+	c := porting.NewCache(env.Tx)
+	var imp *porting.Importer
+	if env.ParamHash != nil {
+		ss := gotfs.RW{Metadata: env.VolTx, Data: env.VolTx}
+		imp = porting.NewImporter(&c, env.GotFS, ss, *env.ParamHash)
+	}
 	return &Tx{
-		tx:        tx,
-		gotkv:     *kvmach,
-		paramHash: paramHash,
-		s:         stores.NewMem(),
+		env: env,
+
+		c:   &c,
+		imp: imp,
 	}
 }
 
-// setup performs idempotent initialization and should be called before
-// performing any operation.
+func (tx *Tx) Cache() *porting.Cache {
+	return tx.c
+}
+
+// setup ensures that the needed buckets exist and that the paramHash matches the staging volume.
 func (tx *Tx) setup(ctx context.Context) error {
-	if tx.kvtx != nil {
-		return nil
-	}
-	var root []byte
-	if err := tx.tx.Load(ctx, &root); err != nil {
+	if _, err := tx.env.Tx.CreateBucketIfNotExists(bucketStage); err != nil {
 		return err
 	}
-	var kvroot gotkv.Root
-	var s stores.RW = tx.tx
+	var root []byte
+	if err := tx.env.VolTx.Load(ctx, &root); err != nil {
+		return err
+	}
+	if tx.env.ParamHash == nil {
+		return nil
+	}
 	if len(root) > 0 {
-		if len(root) < 32 {
-			return fmt.Errorf("too short to be stage root")
+		var paramHash [32]byte
+		copy(paramHash[:], root)
+		if paramHash != *tx.env.ParamHash {
+			return fmt.Errorf("staging volume has wrong parameters %x vs. %x", paramHash, *tx.env.ParamHash)
 		}
-		if tx.paramHash != nil && !bytes.Equal(tx.paramHash[:], root[:32]) {
-			return fmt.Errorf("stage paramHash must match %x vs %x", tx.paramHash[:], root[:32])
+	}
+	return tx.env.VolTx.Save(ctx, tx.env.ParamHash[:])
+}
+
+func (tx *Tx) stageState(ctx context.Context, p string) (staged bool, hasEntries bool, _ error) {
+	b := tx.env.Tx.Bucket(bucketStage)
+	if b == nil {
+		return false, false, nil
+	}
+	if b.Get([]byte(p)) == nil {
+		return false, false, nil
+	}
+	hasEntries, err := tx.c.HasStagedEntries(ctx, p)
+	if err != nil {
+		return false, false, err
+	}
+	return true, hasEntries, nil
+}
+
+func (tx *Tx) loadSegmentForPath(ctx context.Context, p string) (gotfs.Segment, error) {
+	ents, err := tx.c.GetStagedEntries(ctx, p, nil)
+	if err != nil {
+		return gotfs.Segment{}, err
+	}
+	if len(ents) == 0 {
+		return gotfs.Segment{Span: gotfs.SpanForPath(p)}, nil
+	}
+	kvmach := tx.env.GotFS.MetadataKV()
+	kvb := kvmach.NewBuilder(tx.env.VolTx)
+	for _, ent := range ents {
+		k := ent.Key.Marshal(nil)
+		v, err := marshalStagedValue(ent)
+		if err != nil {
+			return gotfs.Segment{}, err
 		}
-		if err := kvroot.Unmarshal(root[32:]); err != nil {
+		if err := kvb.Put(ctx, k, v); err != nil {
+			return gotfs.Segment{}, err
+		}
+	}
+	root, err := kvb.Finish(ctx)
+	if err != nil {
+		return gotfs.Segment{}, err
+	}
+	return gotfs.Segment{Contents: root, Span: gotfs.SpanForPath(p)}, nil
+}
+
+// stagePath adds or replaces a path in the stage and stores its entries.
+func (tx *Tx) stagePath(ctx context.Context, p string, ents []gotfs.Entry) error {
+	if err := tx.setup(ctx); err != nil {
+		return err
+	}
+	p = cleanPath(p)
+	if p == "" {
+		return fmt.Errorf("cannot stage empty path")
+	}
+	if err := tx.CheckConflict(ctx, p); err != nil {
+		return err
+	}
+	if err := tx.c.ReplaceStagedEntries(ctx, p, ents); err != nil {
+		return err
+	}
+	b := tx.env.Tx.Bucket(bucketStage)
+	return b.Put([]byte(p), []byte{})
+}
+
+func (tx *Tx) Abort(ctx context.Context) error {
+	return errors.Join(tx.env.VolTx.Abort(ctx), tx.env.Tx.Rollback())
+}
+
+// Commit commits the transaction to blobcache
+func (tx *Tx) Commit(ctx context.Context) error {
+	// commit to volume first
+	if err := tx.env.VolTx.Commit(ctx); err != nil {
+		return err
+	}
+	// then bolt iff that succeeded
+	return tx.env.Tx.Commit()
+}
+
+// Add adds each file at or beneath p in the filesystem, individually.
+// The filesystem is walked and each file added, will be added as it's own segment.
+func (tx *Tx) Add(ctx context.Context, fsys posixfs.FS, p string) error {
+	p = cleanPath(p)
+
+	it := porting.NewFSInfoIter(fsys, p)
+	return streams.ForEach(ctx, it, func(ent porting.InfoEntry) error {
+		info := ent.Info
+		p := ent.Path
+		if info.Mode.IsDir() {
+			// TODO, this should set the mode on the directory
+			return nil
+		}
+		if _, err := tx.c.UpdateInfo(ctx, p, info); err != nil {
 			return err
 		}
-	} else {
-		r, err := tx.gotkv.NewEmpty(ctx, s)
+		if err := tx.c.SetKnown(ctx, p, &info); err != nil {
+			return err
+		}
+		if err := tx.CheckConflict(ctx, p); err != nil {
+			return err
+		}
+		ctx, cf := metrics.Child(ctx, p)
+		defer cf()
+		ents, err := tx.buildStageEntriesFromFSPath(ctx, fsys, p)
 		if err != nil {
-			// this is for the read only case
-			s = stores.NewMem()
-			r, err = tx.gotkv.NewEmpty(ctx, s)
+			return err
+		}
+		return tx.stagePath(ctx, p, ents)
+	})
+}
+
+// Put replaces all files at or beneath p.
+func (tx *Tx) Put(ctx context.Context, fsys posixfs.FS, p string) error {
+	p = cleanPath(p)
+	fi, err := fsys.Stat(p)
+	if err != nil {
+		if posixfs.IsErrNotExist(err) {
+			if p == "" {
+				return nil
+			}
+			return tx.stagePath(ctx, p, nil)
+		}
+		return err
+	}
+	stagedFiles := map[string]struct{}{}
+	if fi.Mode().IsRegular() {
+		finfo := porting.FileInfo{Mode: fi.Mode(), ModifiedAt: tai64.FromGoTime(fi.ModTime()), Size: fi.Size()}
+		if _, err := tx.c.UpdateInfo(ctx, p, finfo); err != nil {
+			return err
+		}
+		if err := tx.c.SetKnown(ctx, p, &finfo); err != nil {
+			return err
+		}
+		ents, err := tx.buildStageEntriesFromFSPath(ctx, fsys, p)
+		if err != nil {
+			return err
+		}
+		if err := tx.stagePath(ctx, p, ents); err != nil {
+			return err
+		}
+		stagedFiles[p] = struct{}{}
+	} else {
+		if err := streams.ForEach(ctx, porting.NewFSInfoIter(fsys, p), func(ent porting.InfoEntry) error {
+			if ent.Info.Mode.IsDir() {
+				return nil
+			}
+			if _, err := tx.c.UpdateInfo(ctx, ent.Path, ent.Info); err != nil {
+				return err
+			}
+			if err := tx.c.SetKnown(ctx, ent.Path, &ent.Info); err != nil {
+				return err
+			}
+			ents, err := tx.buildStageEntriesFromFSPath(ctx, fsys, ent.Path)
+			if err != nil {
+				return err
+			}
+			if err := tx.stagePath(ctx, ent.Path, ents); err != nil {
+				return err
+			}
+			stagedFiles[ent.Path] = struct{}{}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	prefix := p
+	if prefix != "" {
+		prefix += "/"
+	}
+	it := tx.c.NewInfoIterator()
+	return streams.ForEach(ctx, it, func(ent porting.InfoEntry) error {
+		if ent.Info.Mode.IsDir() {
+			return nil
+		}
+		if p != "" && ent.Path != p && !strings.HasPrefix(ent.Path, prefix) {
+			return nil
+		}
+		if _, ok := stagedFiles[ent.Path]; ok {
+			return nil
+		}
+		if _, err := fsys.Stat(ent.Path); err == nil {
+			return nil
+		} else if !posixfs.IsErrNotExist(err) {
+			return err
+		}
+		return tx.stagePath(ctx, ent.Path, nil)
+	})
+}
+
+func (tx *Tx) buildStageEntriesFromFSPath(ctx context.Context, fsys posixfs.FS, p string) ([]gotfs.Entry, error) {
+	ss := gotfs.RW{Metadata: tx.env.VolTx, Data: tx.env.VolTx}
+	root, err := tx.env.GotFS.NewEmpty(ctx, ss.Metadata, 0o755)
+	if err != nil {
+		return nil, err
+	}
+	var addPath func(string) error
+	addPath = func(p2 string) error {
+		finfo, err := fsys.Stat(p2)
+		if err != nil {
+			return err
+		}
+		if finfo.IsDir() {
+			root, err = tx.env.GotFS.MkdirAll(ctx, ss.Metadata, root, p2)
+			if err != nil {
+				return err
+			}
+			dirents, err := posixfs.ReadDir(fsys, p2)
+			if err != nil {
+				return err
+			}
+			sort.Slice(dirents, func(i, j int) bool {
+				return dirents[i].Name < dirents[j].Name
+			})
+			for _, dirent := range dirents {
+				if err := addPath(path.Join(p2, dirent.Name)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if !finfo.Mode().IsRegular() {
+			return fmt.Errorf("unsupported file mode %v at %q", finfo.Mode(), p2)
+		}
+		parent := path.Dir(p2)
+		if parent != "." && parent != "" {
+			root, err = tx.env.GotFS.MkdirAll(ctx, ss.Metadata, root, parent)
 			if err != nil {
 				return err
 			}
 		}
-		kvroot = r
-	}
-	tx.kvtx = tx.gotkv.NewTx(s, kvroot)
-	return nil
-}
-
-func (tx *Tx) save(ctx context.Context) error {
-	if err := tx.setup(ctx); err != nil {
+		f, err := fsys.OpenFile(p2, posixfs.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		root, err = tx.env.GotFS.PutFile(ctx, ss, root, p2, f)
 		return err
 	}
-	if tx.paramHash == nil {
-		return fmt.Errorf("param has must be set to write to stage")
+	if err := addPath(p); err != nil {
+		return nil, err
 	}
-	root := *tx.paramHash
-	next, err := tx.kvtx.Flush(ctx)
-	if err != nil {
-		return err
+	it := tx.env.GotFS.NewIterator(tx.env.VolTx, root, gotfs.SpanForPath(p))
+	var out []gotfs.Entry
+	for {
+		var ent gotfs.Entry
+		if err := streams.NextUnit(ctx, &it, &ent); err != nil {
+			if streams.IsEOS(err) {
+				break
+			}
+			return nil, err
+		}
+		keyData := ent.Key.Marshal(nil)
+		var keyCopy gotfs.Key
+		if err := keyCopy.Unmarshal(keyData); err != nil {
+			return nil, err
+		}
+		entryCopy := gotfs.Entry{Key: keyCopy}
+		if ent.Key.IsInfo() {
+			entryCopy.Value.Info = ent.Info
+		} else {
+			entryCopy.Value.Extent = ent.Extent
+		}
+		out = append(out, entryCopy)
 	}
-	if err := tx.tx.Save(ctx, next.Marshal(root[:])); err != nil {
-		return err
-	}
-	return nil
+	return out, nil
 }
 
-func (tx *Tx) Abort(ctx context.Context) error {
-	return tx.tx.Abort(ctx)
-}
-
-func (tx *Tx) Commit(ctx context.Context) error {
-	if err := tx.save(ctx); err != nil {
-		return err
-	}
-	return tx.tx.Commit(ctx)
-}
-
-func (tx *Tx) put(ctx context.Context, p string, op Operation) error {
-	if err := tx.setup(ctx); err != nil {
-		return nil
-	}
+// Delete removes all files at or beneath p in base.
+// Delete reads from the gotfs.Root, not the local filesystem.
+func (tx *Tx) Delete(ctx context.Context, fsys posixfs.FS, ss gotfs.RO, base gotfs.Root, p string) error {
 	p = cleanPath(p)
-	if err := tx.CheckConflict(ctx, p); err != nil {
+	// do not allow deletion of a file which still exists on disk.
+	// TODO: maybe the behavior should match git, and we should do the deletion here
+	// if the file matches what is in base.
+	if _, err := fsys.Stat(p); err != nil && !posixfs.IsErrNotExist(err) {
 		return err
+	} else if err == nil {
+		return fmt.Errorf("cannot stage rm, file exists at path %s", p)
 	}
-	val, err := json.Marshal(op)
-	if err != nil {
-		return err
-	}
-	return tx.kvtx.Put(ctx, []byte(p), val)
+	return tx.stagePath(ctx, p, nil)
 }
 
-// Put replaces a path at p with root
-func (tx *Tx) PutRoot(ctx context.Context, p string, root gotfs.Root) error {
-	op := Operation{
-		Put: (*PutOp)(&root),
-	}
-	return tx.put(ctx, p, op)
-}
-
-// PutInfo creates a root, which can be used to overwrite just the info.
-func PutInfo(ctx context.Context, fsmach *gotfs.Machine, ms stores.RW, p string, info gotfs.Info) (gotfs.Root, error) {
-	p = cleanPath(p)
-	root, err := fsmach.NewEmpty(ctx, ms, 0)
-	if err != nil {
-		return gotfs.Root{}, err
-	}
-	return fsmach.PutInfo(ctx, ms, root, p, &info)
-}
-
-// Delete removes a file at p with root
-func (tx *Tx) Delete(ctx context.Context, p string) error {
-	if err := tx.setup(ctx); err != nil {
-		return nil
-	}
-	p = cleanPath(p)
-	if err := tx.CheckConflict(ctx, p); err != nil {
-		return err
-	}
-	fo := Operation{
-		Delete: &DeleteOp{},
-	}
-	val, err := json.Marshal(fo)
-	if err != nil {
-		return err
-	}
-	return tx.kvtx.Put(ctx, []byte(p), val)
-}
-
+// Discard removes any changes staged for p
 func (tx *Tx) Discard(ctx context.Context, p string) error {
 	if err := tx.setup(ctx); err != nil {
 		return err
 	}
 	p = cleanPath(p)
-	if err := tx.kvtx.Delete(ctx, []byte(p)); err != nil {
-		return err
-	}
-	// Also discard any changes to subpaths
-	return tx.ForEach(ctx, func(e Entry) error {
-		if strings.HasPrefix(e.Path, p+"/") {
-			return tx.kvtx.Delete(ctx, []byte(e.Path))
-		}
+	b := tx.env.Tx.Bucket(bucketStage)
+	if b == nil {
 		return nil
-	})
+	}
+	if p == "" {
+		return tx.Clear(ctx)
+	}
+	prefix := []byte(p + "/")
+	var deletes [][]byte
+	c := b.Cursor()
+	start := []byte(p)
+	for k, _ := c.Seek(start); k != nil; k, _ = c.Next() {
+		if bytes.Equal(k, start) {
+			deletes = append(deletes, append([]byte{}, k...))
+			continue
+		}
+		if !bytes.HasPrefix(k, prefix) {
+			break
+		}
+		deletes = append(deletes, append([]byte{}, k...))
+	}
+	for _, k := range deletes {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+		if err := tx.c.DeleteStagedEntries(ctx, string(k)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Get returns the operation, if any, staged for the path p
 // If there is no operation staged Get returns (nil, nil)
-func (tx *Tx) Get(ctx context.Context, p string, dst *Operation) (bool, error) {
-	if err := tx.setup(ctx); err != nil {
+func (tx *Tx) Get(ctx context.Context, p string, dst *gotfs.Segment) (bool, error) {
+	p = cleanPath(p)
+	staged, hasEntries, err := tx.stageState(ctx, p)
+	if err != nil {
 		return false, err
 	}
-	p = cleanPath(p)
-	var val []byte
-	if found, err := tx.kvtx.Get(ctx, []byte(p), &val); err != nil {
-		return false, err
-	} else if !found {
+	if !staged {
 		return false, nil
 	}
-	var op Operation
-	if err := json.Unmarshal(val, &op); err != nil {
-		return false, err
+	if dst != nil {
+		if hasEntries {
+			seg, err := tx.loadSegmentForPath(ctx, p)
+			if err != nil {
+				return false, err
+			}
+			*dst = seg
+		} else {
+			*dst = gotfs.Segment{Span: gotfs.SpanForPath(p)}
+		}
 	}
 	return true, nil
 }
 
-func (tx *Tx) Iterate(ctx context.Context, span gotkv.Span) (*Iterator, error) {
-	if err := tx.setup(ctx); err != nil {
-		return nil, err
+func (tx *Tx) ForEach(ctx context.Context, span gotkv.Span, fn func(Entry) error) error {
+	b := tx.env.Tx.Bucket(bucketStage)
+	if b == nil {
+		return nil
 	}
-	tx.kvtx.Flush(ctx)
-	it := tx.kvtx.Iterate(ctx, span)
-	return &Iterator{it: it}, nil
-}
-
-func (tx *Tx) ForEach(ctx context.Context, fn func(Entry) error) error {
-	it, err := tx.Iterate(ctx, gotkv.TotalSpan())
-	if err != nil {
-		return err
+	c := b.Cursor()
+	for key, _ := c.Seek(span.Begin); key != nil; key, _ = c.Next() {
+		if span.End != nil && bytes.Compare(key, span.End) >= 0 {
+			break
+		}
+		p := string(key)
+		_, hasEntries, err := tx.stageState(ctx, p)
+		if err != nil {
+			return err
+		}
+		ent := Entry{Path: p, HasEntries: hasEntries}
+		if err := fn(ent); err != nil {
+			return err
+		}
 	}
-	return streams.ForEach(ctx, it, fn)
+	return nil
 }
 
 func (tx *Tx) CheckConflict(ctx context.Context, p string) error {
@@ -243,8 +516,7 @@ func (tx *Tx) CheckConflict(ctx context.Context, p string) error {
 	for i := len(parts) - 1; i > 0; i-- {
 		conflictPath := strings.Join(parts[:i], "/")
 		k := cleanPath(conflictPath)
-		var op Operation
-		found, err := tx.Get(ctx, k, &op)
+		found, _, err := tx.stageState(ctx, k)
 		if err != nil {
 			return err
 		}
@@ -252,12 +524,9 @@ func (tx *Tx) CheckConflict(ctx context.Context, p string) error {
 			return newError(p, conflictPath)
 		}
 	}
-	it, err := tx.Iterate(ctx, gotkv.PrefixSpan([]byte(p+"/")))
-	if err != nil {
-		return err
-	}
 	// check for descendents
-	if err := streams.ForEach(ctx, it, func(ent Entry) error {
+	span := gotkv.PrefixSpan([]byte(p + "/"))
+	if err := tx.ForEach(ctx, span, func(ent Entry) error {
 		return newError(p, ent.Path)
 	}); err != nil {
 		return err
@@ -267,63 +536,325 @@ func (tx *Tx) CheckConflict(ctx context.Context, p string) error {
 
 // Clear deletes all entries from the staging area
 func (tx *Tx) Clear(ctx context.Context) error {
-	if err := tx.tx.Save(ctx, []byte{}); err != nil {
+	b := tx.env.Tx.Bucket(bucketStage)
+	if b != nil {
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			if err := tx.c.DeleteStagedEntries(ctx, string(k)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := tx.env.Tx.DeleteBucket(bucketStage); err != nil {
 		return err
 	}
-	tx.kvtx = nil
+	if _, err := tx.env.Tx.CreateBucket(bucketStage); err != nil {
+		return err
+	}
 	return nil
 }
 
+// IsEmpty returns true if the stage is empty
 func (tx *Tx) IsEmpty(ctx context.Context) (bool, error) {
-	it, err := tx.Iterate(ctx, gotkv.TotalSpan())
-	if err != nil {
-		return false, err
-	}
-	if err := streams.NextUnit(ctx, it, &Entry{}); err == nil {
-		return false, nil
-	} else if streams.IsEOS(err) {
+	b := tx.env.Tx.Bucket(bucketStage)
+	if b == nil {
 		return true, nil
-	} else {
-		return false, err
 	}
-}
-
-func (tx *Tx) CreateFunction(ctx context.Context, fsag *gotfs.Machine, ss gotfs.RW) (gotfsvm.Function, error) {
-	it, err := tx.Iterate(ctx, gotkv.TotalSpan())
-	if err != nil {
-		return gotfsvm.Function{}, err
-	}
-	vm := gotfsvm.New(fsag)
-	return vm.NewFunction(ctx, ss.Metadata, func(fb *gotfsvm.FnBuilder) (gotfsvm.Expr[gotfs.Root], error) {
-		baseExpr := fb.Input(0)
-		var segs []gotfs.Segment
-		err = streams.ForEach(ctx, it, func(ent Entry) error {
-			fileOp := ent.Op
-			p := ent.Path
-			switch {
-			case fileOp.Put != nil:
-				baseExpr = fb.MkdirAll(baseExpr, path.Dir(p), 0o755)
-				segs = append(segs, fsag.ShiftOut(gotfs.Root(*fileOp.Put).Segment(), p))
-			case fileOp.Delete != nil:
-				segs = append(segs, gotfs.Segment{
-					Span: gotfs.SpanForPath(p),
-				})
-			default:
-				logctx.Warnf(ctx, "empty op for path %q", p)
-				return nil
-			}
-			return nil
-		})
-		if err != nil {
-			return gotfsvm.Expr[gotfs.Root]{}, err
-		}
-		concatExpr := fb.ChangesOnBase(baseExpr, segs)
-		return fb.Promote(concatExpr), nil
-	})
+	return b.Inspect().KeyN == 0, nil
 }
 
 func (tx *Tx) Store() stores.RW {
-	return tx.tx
+	return tx.env.VolTx
+}
+
+// overlay creates a RW by overlaying the stage volume, over the read-only ss.
+// ss should be the space volume.
+func (tx *Tx) overlay(ss gotfs.RO) gotfs.RW {
+	return gotfs.RW{
+		Data:     stores.NewOverlay(ss.Data, tx.env.VolTx),
+		Metadata: stores.NewOverlay(ss.Metadata, tx.env.VolTx),
+	}
+}
+
+func (tx *Tx) InitialFS(ctx context.Context, ss gotfs.RO) (gotfs.Root, error) {
+	s2 := tx.overlay(ss)
+	base, err := tx.env.GotFS.NewEmpty(ctx, s2.Metadata, 0o755)
+	if err != nil {
+		return gotfs.Root{}, err
+	}
+	return tx.Apply(ctx, ss, base)
+}
+
+// Apply applies the changes to the root and returns them.
+// ss should contain all the data referenced by base.
+// ss will not be written to during Apply.
+func (tx *Tx) Apply(ctx context.Context, ss gotfs.RO, base gotfs.Root) (gotfs.Root, error) {
+	fsvmmach := gotfsvm.New(tx.env.GotFS)
+	s2 := gotfs.RW{
+		Data:     stores.NewOverlay(ss.Data, tx.env.VolTx),
+		Metadata: stores.NewOverlay(ss.Metadata, tx.env.VolTx),
+	}
+	var changes []gotfs.Segment
+	if err := tx.ForEach(ctx, gotkv.TotalSpan(), func(e Entry) error {
+		if !e.HasEntries {
+			changes = append(changes, gotfs.Segment{Span: gotfs.SpanForPath(e.Path)})
+			return nil
+		}
+		seg, err := tx.loadSegmentForPath(ctx, e.Path)
+		if err != nil {
+			return err
+		}
+		changes = append(changes, seg)
+		return nil
+	}); err != nil {
+		return gotfs.Root{}, err
+	}
+	if len(changes) == 0 {
+		return base, nil
+	}
+	sort.Slice(changes, func(i, j int) bool {
+		return bytes.Compare(changes[i].Span.Begin, changes[j].Span.Begin) < 0
+	})
+	parentSet := map[string]struct{}{}
+	var parents []string
+	for _, change := range changes {
+		var k gotfs.Key
+		if err := k.Unmarshal(change.Span.Begin); err != nil {
+			continue
+		}
+		parent := path.Dir(k.Path())
+		if parent == "." || parent == "" {
+			continue
+		}
+		if _, exists := parentSet[parent]; exists {
+			continue
+		}
+		parentSet[parent] = struct{}{}
+		parents = append(parents, parent)
+	}
+	sort.Strings(parents)
+	fn, err := fsvmmach.NewFunction(ctx, s2.Metadata, func(fb *gotfsvm.FnBuilder) (gotfsvm.Expr[gotfs.Root], error) {
+		baseExpr := fb.Input(0)
+		for _, p := range parents {
+			baseExpr = fb.MkdirAll(baseExpr, p, 0o755)
+		}
+		return fb.Promote(fb.ChangesOnBase(baseExpr, changes)), nil
+	})
+	if err != nil {
+		return gotfs.Root{}, err
+	}
+	return fsvmmach.Apply(ctx, s2, fn, []gotfsvm.Input{{Stores: s2.RO(), Root: base}})
+}
+
+type FileOperation struct {
+	// Delete means the file was removed.
+	Delete *DeleteOp
+	Create *CreateOp
+	Modify *ModifyOp
+}
+
+type DeleteOp struct{}
+
+type CreateOp struct {
+	// Mode fs.FileMode
+}
+
+type ModifyOp struct {
+	// Mode fs.FileMode
+}
+
+// ForEachStaged lists all of the staged changes.
+// if base is nil, then paths are not compared against a base filesystem.
+func (tx *Tx) ForEachStaged(ctx context.Context, ss gotfs.RO, base *gotfs.Root, fn func(p string, op FileOperation) error) error {
+	var root gotfs.Root
+	hasBase := base != nil
+	if hasBase {
+		root = *base
+	}
+	return tx.ForEach(ctx, gotkv.Span{}, func(ent Entry) error {
+		var op FileOperation
+		switch {
+		case !ent.HasEntries:
+			// it's a delete
+			op.Delete = &DeleteOp{}
+		default:
+			if !hasBase {
+				op.Create = &CreateOp{}
+				break
+			}
+			md, err := tx.env.GotFS.GetInfo(ctx, ss.Metadata, root, ent.Path)
+			if err != nil && !posixfs.IsErrNotExist(err) {
+				return err
+			}
+			if md == nil {
+				op.Create = &CreateOp{}
+			} else {
+				op.Modify = &ModifyOp{}
+			}
+		}
+		return fn(ent.Path, op)
+	})
+}
+
+// DirtyFile is a file that has changed in the filesystem, but is not in the stage.
+type DirtyFile struct {
+	Path string
+
+	// If true than the file exists in the working copy.
+	// Otherwise the file has been deleted from the working copy, but was previously in GotFS
+	Exists     bool
+	Mode       fs.FileMode
+	ModifiedAt tai64.TAI64N
+}
+
+// ForEachDirty lists all of the files which are dirty.
+// No information is returned for the untracked files.
+// If a file is not in the stage, and is not in base, then it is considered untracked.
+func (tx *Tx) ForEachDirty(ctx context.Context, fsys posixfs.FS, ss gotfs.RO, base gotfs.Root, fn func(df DirtyFile) error) error {
+	if base.Ref.IsZero() {
+		return nil
+	}
+	staged := map[string]struct{}{}
+	if err := tx.ForEach(ctx, gotkv.TotalSpan(), func(ent Entry) error {
+		staged[ent.Path] = struct{}{}
+		return nil
+	}); err != nil {
+		return err
+	}
+	emitted := map[string]struct{}{}
+	emit := func(df DirtyFile) error {
+		if _, exists := emitted[df.Path]; exists {
+			return nil
+		}
+		emitted[df.Path] = struct{}{}
+		return fn(df)
+	}
+	isStaged := func(p string) bool {
+		for {
+			if _, ok := staged[p]; ok {
+				return true
+			}
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+		return false
+	}
+	it := porting.NewFSInfoIter(fsys, "")
+	if err := streams.ForEach(ctx, it, func(ent porting.InfoEntry) error {
+		if ent.Info.Mode.IsDir() {
+			return nil
+		}
+		if isStaged(ent.Path) {
+			return nil
+		}
+		if tracked, err := tx.env.GotFS.Exists(ctx, ss.Metadata, base, ent.Path); err != nil {
+			return err
+		} else if !tracked {
+			return nil
+		}
+		known, err := tx.c.IsKnown(ctx, ent.Path, ent.Info)
+		if err != nil {
+			return err
+		}
+		if known {
+			return nil
+		}
+		return emit(DirtyFile{
+			Path:       ent.Path,
+			Exists:     true,
+			Mode:       ent.Info.Mode,
+			ModifiedAt: ent.Info.ModifiedAt,
+		})
+	}); err != nil {
+		return err
+	}
+
+	var walkBaseFiles func(string) error
+	walkBaseFiles = func(p string) error {
+		return tx.env.GotFS.ReadDir(ctx, ss.Metadata, base, p, func(de gotfs.DirEnt) error {
+			p2 := path.Join(p, de.Name)
+			if de.Mode.IsDir() {
+				return walkBaseFiles(p2)
+			}
+			if isStaged(p2) {
+				return nil
+			}
+			finfo, err := fsys.Stat(p2)
+			if err != nil {
+				if posixfs.IsErrNotExist(err) {
+					return emit(DirtyFile{Path: p2, Exists: false})
+				}
+				return err
+			}
+			known, err := tx.c.IsKnown(ctx, p2, porting.FileInfo{
+				Mode:       finfo.Mode(),
+				ModifiedAt: tai64.FromGoTime(finfo.ModTime()),
+				Size:       finfo.Size(),
+			})
+			if err != nil {
+				return err
+			}
+			if known {
+				return nil
+			}
+			return emit(DirtyFile{
+				Path:       p2,
+				Exists:     true,
+				Mode:       finfo.Mode(),
+				ModifiedAt: tai64.FromGoTime(finfo.ModTime()),
+			})
+		})
+	}
+	if err := walkBaseFiles(""); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ForEachUntracked iterates over all the untracked files.
+func (tx *Tx) ForEachUntracked(ctx context.Context, fsys posixfs.FS, ss gotfs.RO, base *gotfs.Root, fn func(p string) error) error {
+	findStaged := func(p string) (bool, bool, error) {
+		parts := strings.Split(p, "/")
+		for i := len(parts); i > 0; i-- {
+			p2 := strings.Join(parts[:i], "/")
+			found, hasEntries, err := tx.stageState(ctx, p2)
+			if err != nil {
+				return false, false, err
+			}
+			if found {
+				return true, hasEntries, nil
+			}
+		}
+		return false, false, nil
+	}
+	it := porting.NewFSInfoIter(fsys, "")
+	return streams.ForEach(ctx, it, func(ent porting.InfoEntry) error {
+		if ent.Info.Mode.IsDir() {
+			return nil
+		}
+		if hasStaged, tracked, err := findStaged(ent.Path); err != nil {
+			return err
+		} else if hasStaged {
+			if tracked {
+				return nil
+			}
+			return fn(ent.Path)
+		}
+		if base == nil {
+			return fn(ent.Path)
+		}
+		tracked, err := tx.env.GotFS.Exists(ctx, ss.Metadata, *base, ent.Path)
+		if err != nil {
+			return err
+		}
+		if tracked {
+			return nil
+		}
+		return fn(ent.Path)
+	})
 }
 
 func cleanPath(p string) string {
@@ -333,21 +864,4 @@ func cleanPath(p string) string {
 		p = ""
 	}
 	return p
-}
-
-type Iterator struct {
-	it streams.Iterator[gotkv.Entry]
-}
-
-func (it *Iterator) Next(ctx context.Context, dsts []Entry) (int, error) {
-	dst := &dsts[0]
-	var kvent gotkv.Entry
-	if err := streams.NextUnit(ctx, it.it, &kvent); err != nil {
-		return 0, err
-	}
-	if err := json.Unmarshal(kvent.Value, &dst.Op); err != nil {
-		return 0, err
-	}
-	dst.Path = string(kvent.Key)
-	return 1, nil
 }
